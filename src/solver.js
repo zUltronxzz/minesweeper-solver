@@ -1,0 +1,1329 @@
+/**
+ * Minesweeper Instant Solver & Analysis Engine
+ * Features:
+ *  - Multi-tier solver: Trivial -> Gaussian Elimination (RREF) -> Frontier Component CSP
+ *  - Exact probability calculation for 50/50 detection
+ *  - 0ms Instant loop or adjustable Speed Slider (0-500ms) with Step mode
+ *  - Visual highlighting on the board (Safe, Mines, Best Guess with % badge)
+ *  - DOM Adapter for minesweeperonline.com and local simulator
+ */
+
+(function (global) {
+  'use strict';
+
+  // --- Combinatorics Utility ---
+  function nCr(n, r) {
+    if (r < 0 || r > n) return 0;
+    if (r === 0 || r === n) return 1;
+    if (r > n / 2) r = n - r;
+    let res = 1;
+    for (let i = 1; i <= r; i++) {
+      res = (res * (n - i + 1)) / i;
+    }
+    return res;
+  }
+
+  // --- Core Solver Engine (Pure Logic) ---
+  class MinesweeperSolver {
+    /**
+     * @param {Object} boardState
+     * @param {number} boardState.rows
+     * @param {number} boardState.cols
+     * @param {number} boardState.totalMines
+     * @param {Array<Array<{status: string, value: number|null}>>} boardState.grid
+     *   status: 'HIDDEN' | 'FLAGGED' | 'OPEN'
+     *   value: 0..8 when status === 'OPEN'
+     */
+    constructor(boardState) {
+      this.rows = boardState.rows;
+      this.cols = boardState.cols;
+      this.totalMines = boardState.totalMines;
+      this.grid = boardState.grid;
+    }
+
+    getNeighbors(r, c) {
+      const neighbors = [];
+      for (let dr = -1; dr <= 1; dr++) {
+        for (let dc = -1; dc <= 1; dc++) {
+          if (dr === 0 && dc === 0) continue;
+          const nr = r + dr;
+          const nc = c + dc;
+          if (nr >= 0 && nr < this.rows && nc >= 0 && nc < this.cols) {
+            neighbors.push({ r: nr, c: nc, cell: this.grid[nr][nc] });
+          }
+        }
+      }
+      return neighbors;
+    }
+
+    /**
+     * Finds next moves using all solver tiers.
+     * Returns:
+     * {
+     *   safeMoves: Array<{r, c}>,
+     *   mineMoves: Array<{r, c}>,
+     *   bestGuess: {r, c, prob: number, is5050: boolean}|null,
+     *   method: string,
+     *   isGameOver: boolean,
+     *   isWin: boolean
+     * }
+     */
+    findMoves() {
+      const safeMoves = new Map();
+      const mineMoves = new Map();
+
+      const addSafe = (r, c) => safeMoves.set(`${r},${c}`, { r, c });
+      const addMine = (r, c) => mineMoves.set(`${r},${c}`, { r, c });
+
+      // Check board status: total flags vs total unrevealed
+      let hiddenCount = 0;
+      let flagCount = 0;
+      let openCount = 0;
+
+      for (let r = 0; r < this.rows; r++) {
+        for (let c = 0; c < this.cols; c++) {
+          const st = this.grid[r][c].status;
+          if (st === 'HIDDEN') hiddenCount++;
+          else if (st === 'FLAGGED') flagCount++;
+          else if (st === 'OPEN') openCount++;
+        }
+      }
+
+      if (openCount === 0) {
+        // Fresh board: open the strategic center
+        return {
+          safeMoves: [{ r: Math.floor(this.rows / 2), c: Math.floor(this.cols / 2) }],
+          mineMoves: [],
+          bestGuess: null,
+          method: 'Auto-Start Opening',
+          isGameOver: false,
+          isWin: false,
+        };
+      }
+
+      if (hiddenCount === 0) {
+        return {
+          safeMoves: [],
+          mineMoves: [],
+          bestGuess: null,
+          method: 'Solved',
+          isGameOver: true,
+          isWin: true,
+        };
+      }
+
+      // --- Tier 1: Trivial Deduction ---
+      for (let r = 0; r < this.rows; r++) {
+        for (let c = 0; c < this.cols; c++) {
+          const cell = this.grid[r][c];
+          if (cell.status !== 'OPEN' || cell.value === null || cell.value === 0) continue;
+
+          const neighbors = this.getNeighbors(r, c);
+          const hidden = neighbors.filter(n => n.cell.status === 'HIDDEN');
+          const flags = neighbors.filter(n => n.cell.status === 'FLAGGED');
+
+          const remainingMines = cell.value - flags.length;
+
+          if (remainingMines === hidden.length && hidden.length > 0) {
+            hidden.forEach(h => addMine(h.r, h.c));
+          } else if (remainingMines === 0 && hidden.length > 0) {
+            hidden.forEach(h => addSafe(h.r, h.c));
+          }
+        }
+      }
+
+      if (safeMoves.size > 0 || mineMoves.size > 0) {
+        return {
+          safeMoves: Array.from(safeMoves.values()),
+          mineMoves: Array.from(mineMoves.values()),
+          bestGuess: null,
+          method: 'Direct Trivial Deduction',
+          isGameOver: false,
+          isWin: false,
+        };
+      }
+
+      // --- Tier 2: Linear Algebra / Gaussian Elimination ---
+      this.solveGaussian(addSafe, addMine);
+
+      if (safeMoves.size > 0 || mineMoves.size > 0) {
+        return {
+          safeMoves: Array.from(safeMoves.values()),
+          mineMoves: Array.from(mineMoves.values()),
+          bestGuess: null,
+          method: 'Gaussian Linear Elimination',
+          isGameOver: false,
+          isWin: false,
+        };
+      }
+
+      // --- Tier 3: Connected Component CSP & Exact Probability Calculation ---
+      const cspResult = this.solveCSPAndProbabilities(addSafe, addMine);
+
+      if (safeMoves.size > 0 || mineMoves.size > 0) {
+        return {
+          safeMoves: Array.from(safeMoves.values()),
+          mineMoves: Array.from(mineMoves.values()),
+          bestGuess: null,
+          method: 'Constraint Satisfaction (CSP)',
+          isGameOver: false,
+          isWin: false,
+        };
+      }
+
+      // No guaranteed moves exist -> We have reached an ambiguous state / 50-50!
+      return {
+        safeMoves: [],
+        mineMoves: [],
+        bestGuess: cspResult.bestGuess,
+        method: cspResult.bestGuess?.is5050 ? '50/50 Ambiguity' : 'Probabilistic Calculation',
+        isGameOver: false,
+        isWin: false,
+      };
+    }
+
+    /**
+     * Tier 2: Gaussian Elimination on Frontier Matrix
+     */
+    solveGaussian(addSafe, addMine) {
+      const varMap = new Map(); // key 'r,c' -> index
+      const varList = [];
+      const constraints = []; // { clueR, clueC, vars: [idx], sum: target }
+
+      for (let r = 0; r < this.rows; r++) {
+        for (let c = 0; c < this.cols; c++) {
+          const cell = this.grid[r][c];
+          if (cell.status !== 'OPEN' || cell.value === null || cell.value === 0) continue;
+
+          const neighbors = this.getNeighbors(r, c);
+          const hidden = neighbors.filter(n => n.cell.status === 'HIDDEN');
+          const flags = neighbors.filter(n => n.cell.status === 'FLAGGED');
+
+          const remainingMines = cell.value - flags.length;
+          if (hidden.length === 0) continue;
+
+          const varIndices = [];
+          for (const h of hidden) {
+            const key = `${h.r},${h.c}`;
+            if (!varMap.has(key)) {
+              varMap.set(key, varList.length);
+              varList.push({ r: h.r, c: h.c, key });
+            }
+            varIndices.push(varMap.get(key));
+          }
+
+          constraints.push({
+            r,
+            c,
+            vars: varIndices,
+            sum: remainingMines,
+          });
+        }
+      }
+
+      if (varList.length === 0 || constraints.length === 0) return;
+
+      const numVars = varList.length;
+      let matrix = constraints.map(cons => {
+        const row = new Array(numVars + 1).fill(0);
+        for (const v of cons.vars) row[v] = 1;
+        row[numVars] = cons.sum;
+        return row;
+      });
+
+      // Gaussian Elimination to Reduced Row Echelon Form (RREF)
+      const numRows = matrix.length;
+      let pivotRow = 0;
+
+      for (let col = 0; col < numVars && pivotRow < numRows; col++) {
+        let maxRow = pivotRow;
+        for (let i = pivotRow + 1; i < numRows; i++) {
+          if (Math.abs(matrix[i][col]) > Math.abs(matrix[maxRow][col])) {
+            maxRow = i;
+          }
+        }
+
+        if (Math.abs(matrix[maxRow][col]) < 1e-9) continue;
+
+        [matrix[pivotRow], matrix[maxRow]] = [matrix[maxRow], matrix[pivotRow]];
+
+        const pivotVal = matrix[pivotRow][col];
+        for (let j = col; j <= numVars; j++) {
+          matrix[pivotRow][j] /= pivotVal;
+        }
+
+        for (let i = 0; i < numRows; i++) {
+          if (i !== pivotRow && Math.abs(matrix[i][col]) > 1e-9) {
+            const factor = matrix[i][col];
+            for (let j = col; j <= numVars; j++) {
+              matrix[i][j] -= factor * matrix[pivotRow][j];
+            }
+          }
+        }
+        pivotRow++;
+      }
+
+      // Analyze resulting RREF equations
+      for (const row of matrix) {
+        let posVars = [];
+        let negVars = [];
+        let posSum = 0;
+        let negSum = 0;
+
+        for (let j = 0; j < numVars; j++) {
+          const coeff = row[j];
+          if (Math.abs(coeff) > 1e-9) {
+            if (coeff > 0) {
+              posVars.push({ idx: j, coeff });
+              posSum += coeff;
+            } else {
+              negVars.push({ idx: j, coeff });
+              negSum += coeff;
+            }
+          }
+        }
+
+        const b = row[numVars];
+        const eps = 1e-6;
+
+        if (posVars.length > 0 || negVars.length > 0) {
+          if (Math.abs(b - posSum) < eps) {
+            posVars.forEach(v => addMine(varList[v.idx].r, varList[v.idx].c));
+            negVars.forEach(v => addSafe(varList[v.idx].r, varList[v.idx].c));
+          } else if (Math.abs(b - negSum) < eps) {
+            posVars.forEach(v => addSafe(varList[v.idx].r, varList[v.idx].c));
+            negVars.forEach(v => addMine(varList[v.idx].r, varList[v.idx].c));
+          }
+        }
+      }
+    }
+
+    /**
+     * Tier 3: Connected Component CSP & Exact Probability Calculation
+     */
+    solveCSPAndProbabilities(addSafe, addMine) {
+      const varMap = new Map();
+      const varList = [];
+      const constraints = [];
+
+      for (let r = 0; r < this.rows; r++) {
+        for (let c = 0; c < this.cols; c++) {
+          const cell = this.grid[r][c];
+          if (cell.status !== 'OPEN' || cell.value === null || cell.value === 0) continue;
+
+          const neighbors = this.getNeighbors(r, c);
+          const hidden = neighbors.filter(n => n.cell.status === 'HIDDEN');
+          const flags = neighbors.filter(n => n.cell.status === 'FLAGGED');
+
+          const remainingMines = cell.value - flags.length;
+          if (hidden.length === 0) continue;
+
+          const varIndices = [];
+          for (const h of hidden) {
+            const key = `${h.r},${h.c}`;
+            if (!varMap.has(key)) {
+              varMap.set(key, varList.length);
+              varList.push({ r: h.r, c: h.c, key });
+            }
+            varIndices.push(varMap.get(key));
+          }
+
+          constraints.push({
+            id: constraints.length,
+            r,
+            c,
+            vars: varIndices,
+            sum: remainingMines,
+          });
+        }
+      }
+
+      if (varList.length === 0) return { bestGuess: null };
+
+      // Build adjacency graph
+      const varAdj = Array.from({ length: varList.length }, () => new Set());
+      const consForVar = Array.from({ length: varList.length }, () => []);
+
+      for (const cons of constraints) {
+        for (const v of cons.vars) {
+          consForVar[v].push(cons);
+        }
+        for (let i = 0; i < cons.vars.length; i++) {
+          for (let j = i + 1; j < cons.vars.length; j++) {
+            varAdj[cons.vars[i]].add(cons.vars[j]);
+            varAdj[cons.vars[j]].add(cons.vars[i]);
+          }
+        }
+      }
+
+      const visited = new Array(varList.length).fill(false);
+      const components = [];
+
+      for (let i = 0; i < varList.length; i++) {
+        if (visited[i]) continue;
+        const compVars = [];
+        const queue = [i];
+        visited[i] = true;
+
+        while (queue.length > 0) {
+          const curr = queue.shift();
+          compVars.push(curr);
+          for (const neighbor of varAdj[curr]) {
+            if (!visited[neighbor]) {
+              visited[neighbor] = true;
+              queue.push(neighbor);
+            }
+          }
+        }
+
+        const compConsSet = new Set();
+        for (const v of compVars) {
+          for (const c of consForVar[v]) compConsSet.add(c);
+        }
+
+        components.push({
+          vars: compVars,
+          constraints: Array.from(compConsSet),
+        });
+      }
+
+      let bestGuessOverall = null;
+      let minProbOverall = 1.0;
+
+      let totalFlags = 0;
+      let totalHidden = 0;
+      for (let r = 0; r < this.rows; r++) {
+        for (let c = 0; c < this.cols; c++) {
+          if (this.grid[r][c].status === 'FLAGGED') totalFlags++;
+          if (this.grid[r][c].status === 'HIDDEN') totalHidden++;
+        }
+      }
+
+      const globalMinesLeft = Math.max(0, (this.totalMines || 0) - totalFlags);
+      const unconstrainedHidden = Math.max(0, totalHidden - varList.length);
+
+      for (const comp of components) {
+        const localToGlobal = comp.vars;
+        const globalToLocal = new Map();
+        localToGlobal.forEach((gIdx, lIdx) => globalToLocal.set(gIdx, lIdx));
+
+        const localConstraints = comp.constraints.map(c => ({
+          vars: c.vars.map(v => globalToLocal.get(v)),
+          sum: c.sum,
+        }));
+
+        const nVars = localToGlobal.length;
+        if (nVars > 26) continue;
+
+        const validConfigs = [];
+        const assignment = new Array(nVars).fill(-1);
+
+        function backtrack(idx) {
+          if (idx === nVars) {
+            for (const cons of localConstraints) {
+              let s = 0;
+              for (const v of cons.vars) s += assignment[v];
+              if (s !== cons.sum) return;
+            }
+            validConfigs.push([...assignment]);
+            return;
+          }
+
+          assignment[idx] = 0;
+          if (isPartialValid(idx)) backtrack(idx + 1);
+
+          assignment[idx] = 1;
+          if (isPartialValid(idx)) backtrack(idx + 1);
+
+          assignment[idx] = -1;
+        }
+
+        function isPartialValid(assignedUpTo) {
+          for (const cons of localConstraints) {
+            let sumAssigned = 0;
+            let unassignedCount = 0;
+            for (const v of cons.vars) {
+              if (v <= assignedUpTo) {
+                sumAssigned += assignment[v];
+              } else {
+                unassignedCount++;
+              }
+            }
+            if (sumAssigned > cons.sum) return false;
+            if (sumAssigned + unassignedCount < cons.sum) return false;
+          }
+          return true;
+        }
+
+        backtrack(0);
+
+        if (validConfigs.length === 0) continue;
+
+        const varMineCounts = new Array(nVars).fill(0);
+        let totalConfigWeight = 0;
+
+        for (const cfg of validConfigs) {
+          const minesInComp = cfg.reduce((a, b) => a + b, 0);
+          const remainingForBackground = globalMinesLeft - minesInComp;
+          const weight = nCr(unconstrainedHidden, remainingForBackground) || 1;
+          totalConfigWeight += weight;
+
+          for (let i = 0; i < nVars; i++) {
+            if (cfg[i] === 1) {
+              varMineCounts[i] += weight;
+            }
+          }
+        }
+
+        for (let i = 0; i < nVars; i++) {
+          const gIdx = localToGlobal[i];
+          const cell = varList[gIdx];
+
+          if (varMineCounts[i] === 0) {
+            addSafe(cell.r, cell.c);
+          } else if (varMineCounts[i] === totalConfigWeight) {
+            addMine(cell.r, cell.c);
+          } else {
+            const mineProb = varMineCounts[i] / totalConfigWeight;
+            if (mineProb < minProbOverall) {
+              minProbOverall = mineProb;
+              bestGuessOverall = {
+                r: cell.r,
+                c: cell.c,
+                prob: mineProb,
+                safeProb: 1.0 - mineProb,
+                is5050: Math.abs(mineProb - 0.5) < 0.01,
+              };
+            }
+          }
+        }
+      }
+
+      if (unconstrainedHidden > 0 && globalMinesLeft >= 0) {
+        const bgProb = globalMinesLeft / (totalHidden || 1);
+        if (bgProb < minProbOverall) {
+          const frontierSet = new Set(varList.map(v => v.key));
+          for (let r = 0; r < this.rows; r++) {
+            for (let c = 0; c < this.cols; c++) {
+              if (this.grid[r][c].status === 'HIDDEN' && !frontierSet.has(`${r},${c}`)) {
+                minProbOverall = bgProb;
+                bestGuessOverall = {
+                  r,
+                  c,
+                  prob: bgProb,
+                  safeProb: 1.0 - bgProb,
+                  is5050: Math.abs(bgProb - 0.5) < 0.01,
+                  isBackground: true,
+                };
+                break;
+              }
+            }
+            if (bestGuessOverall && bestGuessOverall.isBackground) break;
+          }
+        }
+      }
+
+      return { bestGuess: bestGuessOverall };
+    }
+  }
+
+  // --- DOM Adapter ---
+  class MinesweeperDOMAdapter {
+    constructor() {
+      this.highlightEls = [];
+    }
+
+    getBoardState() {
+      const allDivs = document.querySelectorAll('div[id]');
+      const cellMap = new Map();
+      let maxR = 0;
+      let maxC = 0;
+      let is1Indexed = false;
+
+      for (const el of allDivs) {
+        const match = el.id.match(/^(\d+)_(\d+)$/);
+        if (match) {
+          const r = parseInt(match[1], 10);
+          const c = parseInt(match[2], 10);
+          if (r === 1 || c === 1) is1Indexed = true;
+          maxR = Math.max(maxR, r);
+          maxC = Math.max(maxC, c);
+          cellMap.set(`${r}_${c}`, el);
+        }
+      }
+
+      if (cellMap.size === 0) {
+        const customCells = document.querySelectorAll('.ms-cell[data-r][data-c]');
+        for (const el of customCells) {
+          const r = parseInt(el.getAttribute('data-r'), 10);
+          const c = parseInt(el.getAttribute('data-c'), 10);
+          maxR = Math.max(maxR, r + 1);
+          maxC = Math.max(maxC, c + 1);
+          cellMap.set(`${r}_${c}`, el);
+        }
+        is1Indexed = false;
+      }
+
+      const rows = maxR;
+      const cols = maxC;
+      if (rows === 0 || cols === 0) return null;
+
+      const grid = [];
+      for (let r = 0; r < rows; r++) {
+        const row = [];
+        for (let c = 0; c < cols; c++) {
+          const domR = is1Indexed ? r + 1 : r;
+          const domC = is1Indexed ? c + 1 : c;
+          const el = cellMap.get(`${domR}_${domC}`);
+
+          if (!el) {
+            row.push({ status: 'HIDDEN', value: null, el: null });
+            continue;
+          }
+
+          const cls = el.className || '';
+          let status = 'HIDDEN';
+          let value = null;
+
+          if (cls.includes('blank')) {
+            status = 'HIDDEN';
+          } else if (cls.includes('bombflagged') || cls.includes('flagged')) {
+            status = 'FLAGGED';
+          } else if (cls.includes('open') || cls.includes('revealed')) {
+            status = 'OPEN';
+            const openMatch = cls.match(/open(\d)/) || cls.match(/revealed-(\d)/);
+            value = openMatch ? parseInt(openMatch[1], 10) : 0;
+          } else if (cls.includes('bombdeath') || cls.includes('bombrevealed')) {
+            status = 'DEAD';
+          }
+
+          row.push({ status, value, el });
+        }
+        grid.push(row);
+      }
+
+      let totalMines = 99;
+      if (rows === 9 && cols === 9) totalMines = 10;
+      else if (rows === 16 && cols === 16) totalMines = 40;
+      else if (rows === 16 && cols === 30) totalMines = 99;
+
+      return { rows, cols, totalMines, grid, is1Indexed };
+    }
+
+    clickElement(el, isRightClick = false) {
+      if (!el) return;
+      const button = isRightClick ? 2 : 0;
+      const which = isRightClick ? 3 : 1;
+      const buttons = isRightClick ? 2 : 1;
+
+      const opts = {
+        bubbles: true,
+        cancelable: true,
+        view: window,
+        button,
+        which,
+        buttons,
+      };
+
+      el.dispatchEvent(new MouseEvent('mousedown', opts));
+      el.dispatchEvent(new MouseEvent('mouseup', opts));
+      if (!isRightClick) {
+        el.dispatchEvent(new MouseEvent('click', opts));
+      }
+      if (isRightClick) {
+        el.dispatchEvent(new MouseEvent('contextmenu', opts));
+      }
+    }
+
+    clearHighlights() {
+      document.querySelectorAll('.ms-solver-highlight').forEach(el => el.remove());
+      this.highlightEls = [];
+    }
+
+    highlightCell(el, type, text = '') {
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      const scrollX = window.scrollX || window.pageXOffset || 0;
+      const scrollY = window.scrollY || window.pageYOffset || 0;
+
+      const badge = document.createElement('div');
+      badge.className = `ms-solver-highlight ms-highlight-${type}`;
+      badge.style.cssText = `
+        position: absolute;
+        left: ${rect.left + scrollX}px;
+        top: ${rect.top + scrollY}px;
+        width: ${rect.width}px;
+        height: ${rect.height}px;
+        pointer-events: none;
+        z-index: 999999;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+        font-weight: 800;
+        font-size: 11px;
+        color: #fff;
+        text-shadow: 0 1px 3px rgba(0,0,0,0.8);
+        box-sizing: border-box;
+      `;
+
+      if (type === 'safe') {
+        badge.style.border = '2px solid #10b981';
+        badge.style.backgroundColor = 'rgba(16, 185, 129, 0.35)';
+      } else if (type === 'mine') {
+        badge.style.border = '2px solid #ef4444';
+        badge.style.backgroundColor = 'rgba(239, 68, 68, 0.4)';
+      } else if (type === 'guess') {
+        badge.style.border = '2px solid #f59e0b';
+        badge.style.backgroundColor = 'rgba(245, 158, 11, 0.45)';
+        badge.style.boxShadow = '0 0 12px #f59e0b';
+        badge.textContent = text || '50%';
+      }
+
+      document.body.appendChild(badge);
+      this.highlightEls.push(badge);
+    }
+  }
+
+  // --- Modern Floating HUD Controller ---
+  class MinesweeperHUD {
+    constructor() {
+      this.adapter = new MinesweeperDOMAdapter();
+      this.speedMs = 0;
+      this.safeMode = false; // Default: Safe Mode OFF -> Auto-guesses safest move
+      this.isRunning = false;
+      this.stepCount = 0;
+      this.lastBestGuess = null;
+      this.initUI();
+    }
+
+    initUI() {
+      if (document.getElementById('minesweeper-solver-hud')) {
+        document.getElementById('minesweeper-solver-hud').remove();
+      }
+
+      const hud = document.createElement('div');
+      hud.id = 'minesweeper-solver-hud';
+      hud.innerHTML = `
+        <div class="mshud-header" id="mshud-drag-handle">
+          <div class="mshud-title">
+            <span class="mshud-icon">⚡</span>
+            <span>Minesweeper Instant Solver</span>
+          </div>
+          <div class="mshud-controls">
+            <button class="mshud-btn-min" id="mshud-btn-min" title="Minimize">−</button>
+            <button class="mshud-btn-close" id="mshud-btn-close" title="Close">×</button>
+          </div>
+        </div>
+
+        <div class="mshud-body" id="mshud-body">
+          <div class="mshud-status-row">
+            <span class="mshud-status-indicator" id="mshud-dot"></span>
+            <span class="mshud-status-text" id="mshud-status">Ready</span>
+          </div>
+
+          <div class="mshud-buttons-grid">
+            <button class="mshud-btn mshud-btn-primary" id="mshud-solve-btn">
+              ⚡ Instant Solve
+            </button>
+            <button class="mshud-btn mshud-btn-secondary" id="mshud-step-btn">
+              ▶ Step Move
+            </button>
+          </div>
+
+          <div class="mshud-btn-row">
+            <button class="mshud-btn mshud-btn-warning" id="mshud-guess-btn" style="display: none;">
+              🎯 Take Best Guess (<span id="mshud-guess-prob">50%</span>)
+            </button>
+          </div>
+
+          <div class="mshud-mode-row">
+            <label class="mshud-checkbox-label">
+              <input type="checkbox" id="mshud-safemode-cb" />
+              <span>🛡️ Safe Mode (Pause on 50/50)</span>
+            </label>
+          </div>
+
+          <div class="mshud-slider-container">
+            <div class="mshud-slider-label">
+              <span>Execution Speed:</span>
+              <strong id="mshud-speed-val">0ms (Instant)</strong>
+            </div>
+            <input type="range" id="mshud-speed-slider" min="0" max="500" step="10" value="0" class="mshud-slider" />
+          </div>
+
+          <div class="mshud-stats">
+            <div class="mshud-stat-item">
+              <span class="mshud-stat-label">Steps:</span>
+              <strong id="mshud-stat-steps">0</strong>
+            </div>
+            <div class="mshud-stat-item">
+              <span class="mshud-stat-label">Time:</span>
+              <strong id="mshud-stat-time">0.0ms</strong>
+            </div>
+            <div class="mshud-stat-item">
+              <span class="mshud-stat-label">Logic:</span>
+              <strong id="mshud-stat-method">-</strong>
+            </div>
+          </div>
+        </div>
+      `;
+
+      const style = document.createElement('style');
+      style.id = 'minesweeper-solver-style';
+      style.textContent = `
+        #minesweeper-solver-hud {
+          position: fixed;
+          top: 24px;
+          right: 24px;
+          width: 310px;
+          background: rgba(17, 24, 39, 0.95);
+          backdrop-filter: blur(12px);
+          -webkit-backdrop-filter: blur(12px);
+          border: 1px solid rgba(255, 255, 255, 0.12);
+          border-radius: 12px;
+          box-shadow: 0 16px 40px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.05);
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+          color: #f3f4f6;
+          z-index: 9999999;
+          user-select: none;
+        }
+        .mshud-header {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          padding: 12px 14px;
+          background: rgba(255, 255, 255, 0.04);
+          border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+          border-radius: 12px 12px 0 0;
+          cursor: grab;
+        }
+        .mshud-title {
+          font-size: 13px;
+          font-weight: 700;
+          letter-spacing: 0.3px;
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          color: #60a5fa;
+        }
+        .mshud-controls {
+          display: flex;
+          gap: 6px;
+        }
+        .mshud-btn-min, .mshud-btn-close {
+          background: transparent;
+          border: none;
+          color: #9ca3af;
+          font-size: 16px;
+          cursor: pointer;
+          width: 24px;
+          height: 24px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          border-radius: 6px;
+        }
+        .mshud-btn-min:hover, .mshud-btn-close:hover {
+          background: rgba(255, 255, 255, 0.1);
+          color: #fff;
+        }
+        .mshud-body {
+          padding: 14px;
+          display: flex;
+          flex-direction: column;
+          gap: 12px;
+        }
+        .mshud-status-row {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          background: rgba(0, 0, 0, 0.3);
+          padding: 8px 10px;
+          border-radius: 8px;
+          font-size: 12px;
+        }
+        .mshud-status-indicator {
+          width: 8px;
+          height: 8px;
+          border-radius: 50%;
+          background: #10b981;
+          box-shadow: 0 0 8px #10b981;
+        }
+        .mshud-status-indicator.paused {
+          background: #f59e0b;
+          box-shadow: 0 0 8px #f59e0b;
+        }
+        .mshud-status-indicator.solving {
+          background: #3b82f6;
+          box-shadow: 0 0 8px #3b82f6;
+          animation: mshud-pulse 1s infinite;
+        }
+        @keyframes mshud-pulse {
+          0%, 100% { opacity: 1; transform: scale(1); }
+          50% { opacity: 0.6; transform: scale(1.2); }
+        }
+        .mshud-status-text {
+          font-weight: 500;
+          color: #e5e7eb;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+        .mshud-buttons-grid {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 8px;
+        }
+        .mshud-btn-row {
+          display: flex;
+          flex-direction: column;
+        }
+        .mshud-btn {
+          padding: 9px 12px;
+          border-radius: 8px;
+          border: none;
+          font-size: 12px;
+          font-weight: 600;
+          cursor: pointer;
+          transition: all 0.15s ease;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 6px;
+        }
+        .mshud-btn-primary {
+          background: linear-gradient(135deg, #3b82f6, #2563eb);
+          color: #ffffff;
+          box-shadow: 0 4px 12px rgba(37, 99, 235, 0.35);
+        }
+        .mshud-btn-primary:hover {
+          background: linear-gradient(135deg, #60a5fa, #3b82f6);
+        }
+        .mshud-btn-secondary {
+          background: rgba(255, 255, 255, 0.08);
+          color: #e5e7eb;
+          border: 1px solid rgba(255, 255, 255, 0.12);
+        }
+        .mshud-btn-secondary:hover {
+          background: rgba(255, 255, 255, 0.14);
+          color: #fff;
+        }
+        .mshud-btn-warning {
+          background: linear-gradient(135deg, #f59e0b, #d97706);
+          color: #fff;
+          box-shadow: 0 4px 12px rgba(217, 119, 6, 0.35);
+          width: 100%;
+        }
+        .mshud-btn-warning:hover {
+          background: linear-gradient(135deg, #fbbf24, #f59e0b);
+        }
+        .mshud-mode-row {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          background: rgba(0, 0, 0, 0.25);
+          padding: 8px 10px;
+          border-radius: 8px;
+          font-size: 11px;
+        }
+        .mshud-checkbox-label {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          cursor: pointer;
+          color: #d1d5db;
+          user-select: none;
+          font-weight: 500;
+        }
+        .mshud-checkbox-label input {
+          accent-color: #3b82f6;
+          width: 14px;
+          height: 14px;
+          cursor: pointer;
+        }
+        .mshud-slider-container {
+          background: rgba(0, 0, 0, 0.2);
+          padding: 8px 10px;
+          border-radius: 8px;
+          display: flex;
+          flex-direction: column;
+          gap: 6px;
+        }
+        .mshud-slider-label {
+          display: flex;
+          justify-content: space-between;
+          font-size: 11px;
+          color: #9ca3af;
+        }
+        .mshud-slider-label strong {
+          color: #60a5fa;
+        }
+        .mshud-slider {
+          -webkit-appearance: none;
+          width: 100%;
+          height: 5px;
+          border-radius: 3px;
+          background: rgba(255, 255, 255, 0.15);
+          outline: none;
+        }
+        .mshud-slider::-webkit-slider-thumb {
+          -webkit-appearance: none;
+          width: 14px;
+          height: 14px;
+          border-radius: 50%;
+          background: #3b82f6;
+          cursor: pointer;
+        }
+        .mshud-stats {
+          display: flex;
+          justify-content: space-between;
+          font-size: 11px;
+          color: #9ca3af;
+          border-top: 1px solid rgba(255, 255, 255, 0.06);
+          padding-top: 8px;
+        }
+        .mshud-stat-item strong {
+          color: #e5e7eb;
+          margin-left: 4px;
+        }
+      `;
+
+      document.head.appendChild(style);
+      document.body.appendChild(hud);
+
+      this.bindEvents(hud);
+    }
+
+    bindEvents(hud) {
+      const solveBtn = hud.querySelector('#mshud-solve-btn');
+      const stepBtn = hud.querySelector('#mshud-step-btn');
+      const guessBtn = hud.querySelector('#mshud-guess-btn');
+      const safeModeCb = hud.querySelector('#mshud-safemode-cb');
+      const slider = hud.querySelector('#mshud-speed-slider');
+      const speedVal = hud.querySelector('#mshud-speed-val');
+      const closeBtn = hud.querySelector('#mshud-btn-close');
+      const minBtn = hud.querySelector('#mshud-btn-min');
+      const body = hud.querySelector('#mshud-body');
+
+      if (safeModeCb) {
+        safeModeCb.checked = this.safeMode;
+        safeModeCb.onchange = (e) => {
+          this.safeMode = e.target.checked;
+        };
+      }
+
+      solveBtn.onclick = () => {
+        if (this.isRunning) {
+          this.stop('Stopped by user');
+        } else {
+          this.startInstantSolve();
+        }
+      };
+
+      stepBtn.onclick = () => {
+        this.stepOnce();
+      };
+
+      guessBtn.onclick = () => {
+        this.executeBestGuess();
+      };
+
+      slider.oninput = (e) => {
+        this.speedMs = parseInt(e.target.value, 10);
+        speedVal.textContent = this.speedMs === 0 ? '0ms (Instant)' : `${this.speedMs}ms`;
+      };
+
+      closeBtn.onclick = () => {
+        this.adapter.clearHighlights();
+        hud.remove();
+      };
+
+      minBtn.onclick = () => {
+        body.style.display = body.style.display === 'none' ? 'flex' : 'none';
+        minBtn.textContent = body.style.display === 'none' ? '+' : '−';
+      };
+
+      const header = hud.querySelector('#mshud-drag-handle');
+      let isDragging = false;
+      let startX, startY, initialLeft, initialTop;
+
+      header.onmousedown = (e) => {
+        if (e.target.tagName === 'BUTTON' || e.target.tagName === 'INPUT') return;
+        isDragging = true;
+        startX = e.clientX;
+        startY = e.clientY;
+        const rect = hud.getBoundingClientRect();
+        initialLeft = rect.left;
+        initialTop = rect.top;
+        header.style.cursor = 'grabbing';
+      };
+
+      window.addEventListener('mousemove', (e) => {
+        if (!isDragging) return;
+        const dx = e.clientX - startX;
+        const dy = e.clientY - startY;
+        hud.style.left = `${Math.max(10, initialLeft + dx)}px`;
+        hud.style.top = `${Math.max(10, initialTop + dy)}px`;
+        hud.style.right = 'auto';
+      });
+
+      window.addEventListener('mouseup', () => {
+        if (isDragging) {
+          isDragging = false;
+          header.style.cursor = 'grab';
+        }
+      });
+    }
+
+    setStatus(text, type = 'ready') {
+      const statusEl = document.getElementById('mshud-status');
+      const dotEl = document.getElementById('mshud-dot');
+      if (statusEl) statusEl.textContent = text;
+      if (dotEl) {
+        dotEl.className = 'mshud-status-indicator';
+        if (type === 'solving') dotEl.classList.add('solving');
+        if (type === 'paused') dotEl.classList.add('paused');
+      }
+    }
+
+    updateStats(method = '-', elapsedMs = null) {
+      const stepsEl = document.getElementById('mshud-stat-steps');
+      const methodEl = document.getElementById('mshud-stat-method');
+      const timeEl = document.getElementById('mshud-stat-time');
+      if (stepsEl) stepsEl.textContent = this.stepCount;
+      if (methodEl) methodEl.textContent = method;
+      if (timeEl && elapsedMs !== null) timeEl.textContent = `${elapsedMs.toFixed(1)}ms`;
+    }
+
+    setGuessButton(guess) {
+      const btn = document.getElementById('mshud-guess-btn');
+      const probSpan = document.getElementById('mshud-guess-prob');
+      if (!btn) return;
+
+      if (guess) {
+        this.lastBestGuess = guess;
+        btn.style.display = 'flex';
+        const pct = ((guess.prob || 0.5) * 100).toFixed(1);
+        if (probSpan) probSpan.textContent = `${pct}% Mine Risk`;
+      } else {
+        this.lastBestGuess = null;
+        btn.style.display = 'none';
+      }
+    }
+
+    async startInstantSolve() {
+      this.isRunning = true;
+      const solveBtn = document.getElementById('mshud-solve-btn');
+      if (solveBtn) {
+        solveBtn.innerHTML = '⏹ Stop';
+        solveBtn.classList.remove('mshud-btn-primary');
+        solveBtn.classList.add('mshud-btn-warning');
+      }
+
+      this.setStatus('Solving board...', 'solving');
+      this.setGuessButton(null);
+      this.adapter.clearHighlights();
+
+      const startTime = performance.now();
+      let consecutiveNoMoves = 0;
+
+      while (this.isRunning) {
+        const board = this.adapter.getBoardState();
+        if (!board) {
+          this.stop('No board detected');
+          break;
+        }
+
+        // Check for Game Over loss
+        const isDead = document.querySelector('.bombdeath, .facelost');
+        if (isDead) {
+          const elapsed = (performance.now() - startTime).toFixed(1);
+          this.updateStats('Hit Mine', performance.now() - startTime);
+          this.stop(`💥 Hit a mine in ${elapsed}ms! Game Over`, 'paused');
+          break;
+        }
+
+        const solver = new MinesweeperSolver(board);
+        const res = solver.findMoves();
+
+        if (res.isGameOver) {
+          const elapsed = (performance.now() - startTime).toFixed(1);
+          this.updateStats('Completed', performance.now() - startTime);
+          this.stop(res.isWin ? `🎉 Solved in ${elapsed}ms!` : `Game finished in ${elapsed}ms`);
+          break;
+        }
+
+        if (res.safeMoves.length === 0 && res.mineMoves.length === 0) {
+          // If we just clicked, give the DOM 1 chance to finish opening
+          if (consecutiveNoMoves < 2) {
+            consecutiveNoMoves++;
+            await new Promise(r => setTimeout(r, 20));
+            continue;
+          }
+
+          if (res.bestGuess) {
+            const guess = res.bestGuess;
+            const targetEl = board.grid[guess.r][guess.c].el;
+            const pct = ((guess.prob || 0.5) * 100).toFixed(0);
+
+            if (this.safeMode) {
+              // Safe Mode: Pause and let user decide
+              const elapsed = (performance.now() - startTime).toFixed(1);
+              this.updateStats('50/50 Paused', performance.now() - startTime);
+              this.adapter.highlightCell(targetEl, 'guess', `${pct}%`);
+              this.setGuessButton(guess);
+              this.stop(guess.is5050 ? `⚠️ Paused in ${elapsed}ms: 50/50 at (${guess.r + 1},${guess.c + 1})` : `⚠️ Paused in ${elapsed}ms: Safest is ${(guess.safeProb * 100).toFixed(1)}% safe`, 'paused');
+              break;
+            } else {
+              // Default Mode: Auto-guess the safest calculated tile and keep going!
+              this.stepCount++;
+              const curElapsed = performance.now() - startTime;
+              this.updateStats(`Auto-Guess (${pct}%)`, curElapsed);
+              this.setStatus(`Auto-guessing at (${guess.r + 1},${guess.c + 1}) [${pct}% risk]...`, 'solving');
+              this.adapter.highlightCell(targetEl, 'guess', `${pct}%`);
+              this.adapter.clickElement(targetEl, false);
+              await new Promise(r => setTimeout(r, this.speedMs > 0 ? this.speedMs : 25));
+              this.adapter.clearHighlights();
+              continue;
+            }
+          } else {
+            const elapsed = (performance.now() - startTime).toFixed(1);
+            this.stop(`No moves found (${elapsed}ms)`);
+            break;
+          }
+        }
+
+        consecutiveNoMoves = 0;
+        this.stepCount++;
+        const curElapsed = performance.now() - startTime;
+        this.updateStats(res.method, curElapsed);
+
+        // Apply mines and safe moves
+        for (const m of res.mineMoves) {
+          const cell = board.grid[m.r][m.c];
+          if (cell && cell.status === 'HIDDEN' && cell.el) {
+            this.adapter.clickElement(cell.el, true);
+          }
+        }
+
+        for (const s of res.safeMoves) {
+          const cell = board.grid[s.r][s.c];
+          if (cell && cell.status === 'HIDDEN' && cell.el) {
+            this.adapter.clickElement(cell.el, false);
+          }
+        }
+
+        const delay = this.speedMs > 0 ? this.speedMs : 0;
+        await new Promise(r => setTimeout(r, delay));
+      }
+    }
+
+    stepOnce() {
+      const t0 = performance.now();
+      const board = this.adapter.getBoardState();
+      if (!board) {
+        this.setStatus('No board found', 'ready');
+        return;
+      }
+
+      this.adapter.clearHighlights();
+      this.setGuessButton(null);
+
+      const solver = new MinesweeperSolver(board);
+      const res = solver.findMoves();
+
+      if (res.isGameOver) {
+        this.setStatus(res.isWin ? 'Board already solved!' : 'Game Over', 'ready');
+        return;
+      }
+
+      const elapsed = (performance.now() - t0).toFixed(1);
+
+      if (res.safeMoves.length === 0 && res.mineMoves.length === 0) {
+        if (res.bestGuess) {
+          const guess = res.bestGuess;
+          const targetEl = board.grid[guess.r][guess.c].el;
+          const pct = ((guess.prob || 0.5) * 100).toFixed(0);
+          this.adapter.highlightCell(targetEl, 'guess', `${pct}%`);
+          this.setGuessButton(guess);
+          this.updateStats('50/50 Found', parseFloat(elapsed));
+          this.setStatus(`50/50 in ${elapsed}ms: (${guess.r + 1},${guess.c + 1})`, 'paused');
+        } else {
+          this.setStatus(`No deductions in ${elapsed}ms`, 'ready');
+        }
+        return;
+      }
+
+      this.stepCount++;
+      this.updateStats(res.method, parseFloat(elapsed));
+      this.setStatus(`Step in ${elapsed}ms (${res.safeMoves.length} safe, ${res.mineMoves.length} mines)`, 'ready');
+
+      for (const m of res.mineMoves) {
+        const cell = board.grid[m.r][m.c];
+        if (cell && cell.status === 'HIDDEN' && cell.el) {
+          this.adapter.highlightCell(cell.el, 'mine');
+          this.adapter.clickElement(cell.el, true);
+        }
+      }
+
+      for (const s of res.safeMoves) {
+        const cell = board.grid[s.r][s.c];
+        if (cell && cell.status === 'HIDDEN' && cell.el) {
+          this.adapter.highlightCell(cell.el, 'safe');
+          this.adapter.clickElement(cell.el, false);
+        }
+      }
+    }
+
+    async executeBestGuess() {
+      if (!this.lastBestGuess) return;
+      const board = this.adapter.getBoardState();
+      if (!board) return;
+
+      const guess = this.lastBestGuess;
+      const cell = board.grid[guess.r][guess.c];
+      this.adapter.clearHighlights();
+      this.setGuessButton(null);
+
+      if (cell && cell.el) {
+        this.setStatus(`Clicked best guess at (${guess.r + 1},${guess.c + 1})...`, 'solving');
+        this.adapter.clickElement(cell.el, false);
+
+        // Give the click 60ms to reveal before starting the instant solve loop
+        await new Promise(r => setTimeout(r, 60));
+
+        // Auto-continue instant solving!
+        this.startInstantSolve();
+      }
+    }
+
+    stop(statusText = 'Stopped', type = 'ready') {
+      this.isRunning = false;
+      const solveBtn = document.getElementById('mshud-solve-btn');
+      if (solveBtn) {
+        solveBtn.innerHTML = '⚡ Instant Solve';
+        solveBtn.classList.add('mshud-btn-primary');
+        solveBtn.classList.remove('mshud-btn-warning');
+      }
+      this.setStatus(statusText, type);
+    }
+  }
+
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = {
+      MinesweeperSolver,
+      MinesweeperDOMAdapter,
+    };
+  } else {
+    global.MinesweeperSolver = MinesweeperSolver;
+    global.MinesweeperDOMAdapter = MinesweeperDOMAdapter;
+    global.MinesweeperHUD = MinesweeperHUD;
+    global.initMinesweeperSolver = function () {
+      return new MinesweeperHUD();
+    };
+    if (typeof document !== 'undefined' && document.body) {
+      global.initMinesweeperSolver();
+    }
+  }
+})(typeof window !== 'undefined' ? window : global);
