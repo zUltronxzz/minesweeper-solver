@@ -1,18 +1,7 @@
-/**
- * Minesweeper Instant Solver & Analysis Engine
- * Features:
- *  - Multi-tier solver: Trivial -> Gaussian Elimination (RREF) -> Frontier Component CSP
- *  - Exact probability calculation for 50/50 detection
- *  - 0ms Instant loop or adjustable Speed Slider (0-500ms) with Step mode
- *  - Visual highlighting on the board (Safe, Mines, Best Guess with % badge)
- *  - DOM Adapter for minesweeperonline.com and local simulator
- */
-
 (function (global) {
   'use strict';
 
-  // --- Combinatorics Utility ---
-  function nCr(n, r) {
+  function combinations(n, r) {
     if (r < 0 || r > n) return 0;
     if (r === 0 || r === n) return 1;
     if (r > n / 2) r = n - r;
@@ -23,22 +12,12 @@
     return res;
   }
 
-  // --- Core Solver Engine (Pure Logic) ---
   class MinesweeperSolver {
-    /**
-     * @param {Object} boardState
-     * @param {number} boardState.rows
-     * @param {number} boardState.cols
-     * @param {number} boardState.totalMines
-     * @param {Array<Array<{status: string, value: number|null}>>} boardState.grid
-     *   status: 'HIDDEN' | 'FLAGGED' | 'OPEN'
-     *   value: 0..8 when status === 'OPEN'
-     */
-    constructor(boardState) {
-      this.rows = boardState.rows;
-      this.cols = boardState.cols;
-      this.totalMines = boardState.totalMines;
-      this.grid = boardState.grid;
+    constructor(board) {
+      this.rows = board.rows;
+      this.cols = board.cols;
+      this.totalMines = board.totalMines;
+      this.grid = board.grid;
     }
 
     getNeighbors(r, c) {
@@ -56,18 +35,6 @@
       return neighbors;
     }
 
-    /**
-     * Finds next moves using all solver tiers.
-     * Returns:
-     * {
-     *   safeMoves: Array<{r, c}>,
-     *   mineMoves: Array<{r, c}>,
-     *   bestGuess: {r, c, prob: number, is5050: boolean}|null,
-     *   method: string,
-     *   isGameOver: boolean,
-     *   isWin: boolean
-     * }
-     */
     findMoves() {
       const safeMoves = new Map();
       const mineMoves = new Map();
@@ -75,27 +42,23 @@
       const addSafe = (r, c) => safeMoves.set(`${r},${c}`, { r, c });
       const addMine = (r, c) => mineMoves.set(`${r},${c}`, { r, c });
 
-      // Check board status: total flags vs total unrevealed
       let hiddenCount = 0;
-      let flagCount = 0;
       let openCount = 0;
 
       for (let r = 0; r < this.rows; r++) {
         for (let c = 0; c < this.cols; c++) {
           const st = this.grid[r][c].status;
           if (st === 'HIDDEN') hiddenCount++;
-          else if (st === 'FLAGGED') flagCount++;
           else if (st === 'OPEN') openCount++;
         }
       }
 
       if (openCount === 0) {
-        // Fresh board: open the strategic center
         return {
           safeMoves: [{ r: Math.floor(this.rows / 2), c: Math.floor(this.cols / 2) }],
           mineMoves: [],
           bestGuess: null,
-          method: 'Auto-Start Opening',
+          method: 'Opening Move',
           isGameOver: false,
           isWin: false,
         };
@@ -112,7 +75,7 @@
         };
       }
 
-      // --- Tier 1: Trivial Deduction ---
+      // Direct count deductions
       for (let r = 0; r < this.rows; r++) {
         for (let c = 0; c < this.cols; c++) {
           const cell = this.grid[r][c];
@@ -121,7 +84,6 @@
           const neighbors = this.getNeighbors(r, c);
           const hidden = neighbors.filter(n => n.cell.status === 'HIDDEN');
           const flags = neighbors.filter(n => n.cell.status === 'FLAGGED');
-
           const remainingMines = cell.value - flags.length;
 
           if (remainingMines === hidden.length && hidden.length > 0) {
@@ -137,13 +99,13 @@
           safeMoves: Array.from(safeMoves.values()),
           mineMoves: Array.from(mineMoves.values()),
           bestGuess: null,
-          method: 'Direct Trivial Deduction',
+          method: 'Direct Logic',
           isGameOver: false,
           isWin: false,
         };
       }
 
-      // --- Tier 2: Linear Algebra / Gaussian Elimination ---
+      // Gaussian elimination on boundary equations
       this.solveGaussian(addSafe, addMine);
 
       if (safeMoves.size > 0 || mineMoves.size > 0) {
@@ -151,44 +113,40 @@
           safeMoves: Array.from(safeMoves.values()),
           mineMoves: Array.from(mineMoves.values()),
           bestGuess: null,
-          method: 'Gaussian Linear Elimination',
+          method: 'Gaussian RREF',
           isGameOver: false,
           isWin: false,
         };
       }
 
-      // --- Tier 3: Connected Component CSP & Exact Probability Calculation ---
-      const cspResult = this.solveCSPAndProbabilities(addSafe, addMine);
+      // Exact frontier CSP & combinatorial probability
+      const csp = this.solveCSP(addSafe, addMine);
 
       if (safeMoves.size > 0 || mineMoves.size > 0) {
         return {
           safeMoves: Array.from(safeMoves.values()),
           mineMoves: Array.from(mineMoves.values()),
           bestGuess: null,
-          method: 'Constraint Satisfaction (CSP)',
+          method: 'Frontier CSP',
           isGameOver: false,
           isWin: false,
         };
       }
 
-      // No guaranteed moves exist -> We have reached an ambiguous state / 50-50!
       return {
         safeMoves: [],
         mineMoves: [],
-        bestGuess: cspResult.bestGuess,
-        method: cspResult.bestGuess?.is5050 ? '50/50 Ambiguity' : 'Probabilistic Calculation',
+        bestGuess: csp.bestGuess,
+        method: csp.bestGuess?.is5050 ? '50/50' : 'Probability',
         isGameOver: false,
         isWin: false,
       };
     }
 
-    /**
-     * Tier 2: Gaussian Elimination on Frontier Matrix
-     */
     solveGaussian(addSafe, addMine) {
-      const varMap = new Map(); // key 'r,c' -> index
+      const varMap = new Map();
       const varList = [];
-      const constraints = []; // { clueR, clueC, vars: [idx], sum: target }
+      const constraints = [];
 
       for (let r = 0; r < this.rows; r++) {
         for (let c = 0; c < this.cols; c++) {
@@ -198,7 +156,6 @@
           const neighbors = this.getNeighbors(r, c);
           const hidden = neighbors.filter(n => n.cell.status === 'HIDDEN');
           const flags = neighbors.filter(n => n.cell.status === 'FLAGGED');
-
           const remainingMines = cell.value - flags.length;
           if (hidden.length === 0) continue;
 
@@ -212,26 +169,20 @@
             varIndices.push(varMap.get(key));
           }
 
-          constraints.push({
-            r,
-            c,
-            vars: varIndices,
-            sum: remainingMines,
-          });
+          constraints.push({ r, c, vars: varIndices, sum: remainingMines });
         }
       }
 
       if (varList.length === 0 || constraints.length === 0) return;
 
       const numVars = varList.length;
-      let matrix = constraints.map(cons => {
+      const matrix = constraints.map(cons => {
         const row = new Array(numVars + 1).fill(0);
         for (const v of cons.vars) row[v] = 1;
         row[numVars] = cons.sum;
         return row;
       });
 
-      // Gaussian Elimination to Reduced Row Echelon Form (RREF)
       const numRows = matrix.length;
       let pivotRow = 0;
 
@@ -263,7 +214,6 @@
         pivotRow++;
       }
 
-      // Analyze resulting RREF equations
       for (const row of matrix) {
         let posVars = [];
         let negVars = [];
@@ -298,10 +248,7 @@
       }
     }
 
-    /**
-     * Tier 3: Connected Component CSP & Exact Probability Calculation
-     */
-    solveCSPAndProbabilities(addSafe, addMine) {
+    solveCSP(addSafe, addMine) {
       const varMap = new Map();
       const varList = [];
       const constraints = [];
@@ -314,7 +261,6 @@
           const neighbors = this.getNeighbors(r, c);
           const hidden = neighbors.filter(n => n.cell.status === 'HIDDEN');
           const flags = neighbors.filter(n => n.cell.status === 'FLAGGED');
-
           const remainingMines = cell.value - flags.length;
           if (hidden.length === 0) continue;
 
@@ -328,19 +274,12 @@
             varIndices.push(varMap.get(key));
           }
 
-          constraints.push({
-            id: constraints.length,
-            r,
-            c,
-            vars: varIndices,
-            sum: remainingMines,
-          });
+          constraints.push({ r, c, vars: varIndices, sum: remainingMines });
         }
       }
 
       if (varList.length === 0) return { bestGuess: null };
 
-      // Build adjacency graph
       const varAdj = Array.from({ length: varList.length }, () => new Set());
       const consForVar = Array.from({ length: varList.length }, () => []);
 
@@ -381,14 +320,11 @@
           for (const c of consForVar[v]) compConsSet.add(c);
         }
 
-        components.push({
-          vars: compVars,
-          constraints: Array.from(compConsSet),
-        });
+        components.push({ vars: compVars, constraints: Array.from(compConsSet) });
       }
 
-      let bestGuessOverall = null;
-      let minProbOverall = 1.0;
+      let bestGuess = null;
+      let minProb = 1.0;
 
       let totalFlags = 0;
       let totalHidden = 0;
@@ -456,7 +392,6 @@
         }
 
         backtrack(0);
-
         if (validConfigs.length === 0) continue;
 
         const varMineCounts = new Array(nVars).fill(0);
@@ -465,13 +400,11 @@
         for (const cfg of validConfigs) {
           const minesInComp = cfg.reduce((a, b) => a + b, 0);
           const remainingForBackground = globalMinesLeft - minesInComp;
-          const weight = nCr(unconstrainedHidden, remainingForBackground) || 1;
+          const weight = combinations(unconstrainedHidden, remainingForBackground) || 1;
           totalConfigWeight += weight;
 
           for (let i = 0; i < nVars; i++) {
-            if (cfg[i] === 1) {
-              varMineCounts[i] += weight;
-            }
+            if (cfg[i] === 1) varMineCounts[i] += weight;
           }
         }
 
@@ -485,9 +418,9 @@
             addMine(cell.r, cell.c);
           } else {
             const mineProb = varMineCounts[i] / totalConfigWeight;
-            if (mineProb < minProbOverall) {
-              minProbOverall = mineProb;
-              bestGuessOverall = {
+            if (mineProb < minProb) {
+              minProb = mineProb;
+              bestGuess = {
                 r: cell.r,
                 c: cell.c,
                 prob: mineProb,
@@ -501,13 +434,13 @@
 
       if (unconstrainedHidden > 0 && globalMinesLeft >= 0) {
         const bgProb = globalMinesLeft / (totalHidden || 1);
-        if (bgProb < minProbOverall) {
+        if (bgProb < minProb) {
           const frontierSet = new Set(varList.map(v => v.key));
           for (let r = 0; r < this.rows; r++) {
             for (let c = 0; c < this.cols; c++) {
               if (this.grid[r][c].status === 'HIDDEN' && !frontierSet.has(`${r},${c}`)) {
-                minProbOverall = bgProb;
-                bestGuessOverall = {
+                minProb = bgProb;
+                bestGuess = {
                   r,
                   c,
                   prob: bgProb,
@@ -518,16 +451,15 @@
                 break;
               }
             }
-            if (bestGuessOverall && bestGuessOverall.isBackground) break;
+            if (bestGuess && bestGuess.isBackground) break;
           }
         }
       }
 
-      return { bestGuess: bestGuessOverall };
+      return { bestGuess };
     }
   }
 
-  // --- DOM Adapter ---
   class MinesweeperDOMAdapter {
     constructor() {
       this.highlightEls = [];
@@ -685,12 +617,11 @@
     }
   }
 
-  // --- Modern Floating HUD Controller ---
   class MinesweeperHUD {
     constructor() {
       this.adapter = new MinesweeperDOMAdapter();
       this.speedMs = 0;
-      this.safeMode = false; // Default: Safe Mode OFF -> Auto-guesses safest move
+      this.safeMode = false;
       this.isRunning = false;
       this.stepCount = 0;
       this.lastBestGuess = null;
@@ -708,7 +639,7 @@
         <div class="mshud-header" id="mshud-drag-handle">
           <div class="mshud-title">
             <span class="mshud-icon">⚡</span>
-            <span>Minesweeper Instant Solver</span>
+            <span>Minesweeper Solver</span>
           </div>
           <div class="mshud-controls">
             <button class="mshud-btn-min" id="mshud-btn-min" title="Minimize">−</button>
@@ -1135,7 +1066,6 @@
           break;
         }
 
-        // Check for Game Over loss
         const isDead = document.querySelector('.bombdeath, .facelost');
         if (isDead) {
           const elapsed = (performance.now() - startTime).toFixed(1);
@@ -1155,7 +1085,6 @@
         }
 
         if (res.safeMoves.length === 0 && res.mineMoves.length === 0) {
-          // If we just clicked, give the DOM 1 chance to finish opening
           if (consecutiveNoMoves < 2) {
             consecutiveNoMoves++;
             await new Promise(r => setTimeout(r, 20));
@@ -1168,7 +1097,6 @@
             const pct = ((guess.prob || 0.5) * 100).toFixed(0);
 
             if (this.safeMode) {
-              // Safe Mode: Pause and let user decide
               const elapsed = (performance.now() - startTime).toFixed(1);
               this.updateStats('50/50 Paused', performance.now() - startTime);
               this.adapter.highlightCell(targetEl, 'guess', `${pct}%`);
@@ -1176,7 +1104,6 @@
               this.stop(guess.is5050 ? `⚠️ Paused in ${elapsed}ms: 50/50 at (${guess.r + 1},${guess.c + 1})` : `⚠️ Paused in ${elapsed}ms: Safest is ${(guess.safeProb * 100).toFixed(1)}% safe`, 'paused');
               break;
             } else {
-              // Default Mode: Auto-guess the safest calculated tile and keep going!
               this.stepCount++;
               const curElapsed = performance.now() - startTime;
               this.updateStats(`Auto-Guess (${pct}%)`, curElapsed);
@@ -1199,7 +1126,6 @@
         const curElapsed = performance.now() - startTime;
         this.updateStats(res.method, curElapsed);
 
-        // Apply mines and safe moves
         for (const m of res.mineMoves) {
           const cell = board.grid[m.r][m.c];
           if (cell && cell.status === 'HIDDEN' && cell.el) {
@@ -1289,11 +1215,7 @@
       if (cell && cell.el) {
         this.setStatus(`Clicked best guess at (${guess.r + 1},${guess.c + 1})...`, 'solving');
         this.adapter.clickElement(cell.el, false);
-
-        // Give the click 60ms to reveal before starting the instant solve loop
         await new Promise(r => setTimeout(r, 60));
-
-        // Auto-continue instant solving!
         this.startInstantSolve();
       }
     }
